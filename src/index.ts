@@ -100,11 +100,106 @@ server.registerTool(
   },
 );
 
+/* ───────────────────────── generate_campaign_report ─────────────────────────
+ * 계산 도구가 아니라, Claude에게 "이 형식으로 광고주 보고용 리포트를 써라"는
+ * 구조화된 지침 + 정리된 입력 데이터를 반환하는 프롬프트 스캐폴딩 도구.
+ */
+const reportInputShape = {
+  media_data: z
+    .string()
+    .min(1, 'media_data는 비어 있을 수 없습니다.')
+    .describe('미디어팀 리포트 내용 — 숫자/표/텍스트 무엇이든 (노출·조회·VTR·CPV·채널별 성과 등)'),
+  consumer_data: z
+    .string()
+    .min(1, 'consumer_data는 비어 있을 수 없습니다.')
+    .describe('소비자 반응 — 댓글, 긍/부정, 키워드 언급량 등'),
+  campaign_context: z
+    .string()
+    .min(1, 'campaign_context는 비어 있을 수 없습니다.')
+    .describe('브랜드명, 캠페인 목적, 목표 KPI 등 배경 정보'),
+};
+
+const reportSection = z.object({
+  no: z.number(),
+  title: z.string(),
+  guide: z.string().describe('이 섹션에 무엇을 써야 하는지에 대한 작성 지침'),
+});
+const reportOutputShape = {
+  campaign_context: z.string(),
+  media_data: z.string(),
+  consumer_data: z.string(),
+  structure: z.array(reportSection).describe('작성해야 할 리포트 섹션 5개 (순서·제목·지침)'),
+  instructions: z.string().describe('Claude가 따라야 할 종합 작성 규칙'),
+};
+
+// 리포트 섹션 정의 (출력 구조 1~5)
+const REPORT_SECTIONS = [
+  { no: 1, title: '캠페인 총평', guide: '미디어 성과와 소비자 반응을 종합한 한 문단(3~5문장) 요약. 핵심 결론을 먼저 제시.' },
+  { no: 2, title: '미디어 성과', guide: '핵심 KPI(노출·조회·VTR·CPV·소진 등)를 해석. 목표 KPI 대비 달성 여부와 채널별 효율을 강조. 수치는 입력 데이터에 있는 것만 사용.' },
+  { no: 3, title: '소비자 반응', guide: '긍정/부정/중립 비율과 주요 반응·키워드를 정리. 인상적인 댓글, 언급량 변화 등 구체적 근거 포함.' },
+  { no: 4, title: '미디어-소비자 연결 인사이트', guide: '성과가 좋았던 채널/소재와 소비자 반응의 상관관계를 연결. 어떤 매체 노출이 어떤 반응을 유발했는지 가설과 근거를 제시.' },
+  { no: 5, title: '다음 캠페인 제언', guide: '데이터에 근거한 실행 가능한 제언 2~3가지. 예산 배분·채널 선택·메시지 방향 등 구체적으로.' },
+];
+
+function reportPrompt(ctx: string, media: string, consumer: string): string {
+  const fmt = REPORT_SECTIONS.map(s => `${s.no}. ${s.title}\n   → ${s.guide}`).join('\n');
+  return [
+    '당신은 광고대행사 AE입니다. 아래 [입력 데이터]만 근거로, 광고주 보고용 "캠페인 리포트 초안"을 한국어로 작성하세요.',
+    '',
+    '[작성 형식] — 아래 5개 섹션을 이 순서·제목 그대로 작성',
+    fmt,
+    '',
+    '[입력 데이터]',
+    '■ 캠페인 컨텍스트',
+    ctx,
+    '',
+    '■ 미디어 성과 데이터',
+    media,
+    '',
+    '■ 소비자 반응 데이터',
+    consumer,
+    '',
+    '[작성 규칙]',
+    '- 각 섹션 제목을 그대로 사용하고, 섹션 순서를 지킬 것',
+    '- 입력 데이터에 없는 수치·사실은 지어내지 말 것 (불충분하면 "데이터 부족"으로 명시)',
+    '- 광고주가 읽는 문서이므로 전문적이되 간결하게, 결론을 먼저',
+    '- 4번 섹션은 반드시 미디어 성과와 소비자 반응을 "연결"하는 인사이트일 것',
+  ].join('\n');
+}
+
+server.registerTool(
+  'generate_campaign_report',
+  {
+    title: '캠페인 리포트 초안 생성 가이드',
+    description:
+      '미디어 성과 + 소비자 반응 + 캠페인 컨텍스트를 입력받아, 광고주 보고용 캠페인 리포트를 ' +
+      '작성하기 위한 구조화된 지침(5개 섹션)과 정리된 데이터를 반환합니다. ' +
+      '계산 도구가 아니라, Claude가 이 구조대로 리포트를 작성하도록 안내하는 프롬프트 스캐폴딩입니다.',
+    inputSchema: reportInputShape,
+    outputSchema: reportOutputShape,
+  },
+  async ({ media_data, consumer_data, campaign_context }) => {
+    const structured = {
+      campaign_context,
+      media_data,
+      consumer_data,
+      structure: REPORT_SECTIONS,
+      instructions:
+        '위 structure의 5개 섹션을 순서·제목 그대로 작성하되, 입력 데이터에 근거하고 수치를 지어내지 말 것. ' +
+        '4번 섹션은 미디어 성과와 소비자 반응을 연결하는 인사이트여야 함.',
+    };
+    return {
+      content: [{ type: 'text', text: reportPrompt(campaign_context, media_data, consumer_data) }],
+      structuredContent: structured,
+    };
+  },
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stdio 서버는 stdout을 프로토콜에 사용하므로 로그는 stderr로
-  console.error('mcp-budget-server (stdio) 시작됨 — analyze_estimate 도구 제공');
+  console.error('mcp-budget-server (stdio) 시작됨 — analyze_estimate, generate_campaign_report 도구 제공');
 }
 
 main().catch(err => {
