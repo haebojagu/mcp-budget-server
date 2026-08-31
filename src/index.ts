@@ -195,11 +195,101 @@ server.registerTool(
   },
 );
 
+/* ───────────────────────── analyze_youtube_comments ─────────────────────────
+ * 계산 도구가 아니라, Claude에게 "이 형식으로 유튜브 댓글을 정성 분석하라"는
+ * 구조화된 지침 + 정리된 댓글 데이터를 반환하는 프롬프트 스캐폴딩 도구.
+ * YouTube API 호출 없음 — 사용자가 붙여넣은 댓글 텍스트만 처리.
+ */
+const youtubeInputShape = {
+  comments: z
+    .string()
+    .min(1, 'comments는 비어 있을 수 없습니다.')
+    .describe('붙여넣은 유튜브 댓글 텍스트 (여러 줄 가능, 한 줄에 댓글 하나 정도)'),
+  video_context: z
+    .string()
+    .optional()
+    .describe('영상/캠페인에 대한 설명 (제목, 브랜드, 목적 등) — 선택'),
+};
+
+const youtubeSection = z.object({
+  no: z.number(),
+  title: z.string(),
+  guide: z.string().describe('이 섹션에 무엇을 써야 하는지에 대한 작성 지침'),
+});
+const youtubeOutputShape = {
+  video_context: z.string().optional(),
+  comments: z.string(),
+  structure: z.array(youtubeSection).describe('작성해야 할 분석 섹션 5개 (순서·제목·지침)'),
+  instructions: z.string().describe('Claude가 따라야 할 종합 작성 규칙'),
+};
+
+// 댓글 분석 섹션 정의 (출력 구조 1~5)
+const YOUTUBE_SECTIONS = [
+  { no: 1, title: '감성 분포', guide: '긍정/부정/중립 비율을 추정. 실제 댓글 내용에 근거해 대략적인 퍼센트나 비중으로 제시.' },
+  { no: 2, title: '대표 긍정 반응', guide: '긍정적인 댓글 중 대표적인 것을 실제 댓글 원문 그대로 인용하며 정리.' },
+  { no: 3, title: '대표 부정/이슈 반응', guide: '부정적이거나 우려·불만이 담긴 댓글을 실제 원문 인용과 함께 플래그. 없으면 "특이 이슈 없음"으로 명시.' },
+  { no: 4, title: '핵심 키워드', guide: '댓글에서 자주 등장한 단어·표현·주제를 추출해 나열.' },
+  { no: 5, title: '종합 인사이트', guide: '위 내용을 종합해 캠페인 관점에서 시사하는 바를 제시. 다음 액션에 참고할 만한 결론 위주로.' },
+];
+
+function youtubePrompt(ctx: string | undefined, comments: string): string {
+  const fmt = YOUTUBE_SECTIONS.map(s => `${s.no}. ${s.title}\n   → ${s.guide}`).join('\n');
+  return [
+    '당신은 광고대행사 AE입니다. 아래 [입력 데이터]만 근거로, 유튜브 댓글에 대한 "정성 분석"을 한국어로 작성하세요.',
+    '',
+    '[작성 형식] — 아래 5개 섹션을 이 순서·제목 그대로 작성',
+    fmt,
+    '',
+    '[입력 데이터]',
+    '■ 영상/캠페인 설명',
+    ctx?.trim() || '(제공되지 않음)',
+    '',
+    '■ 댓글',
+    comments,
+    '',
+    '[작성 규칙]',
+    '- 각 섹션 제목을 그대로 사용하고, 섹션 순서를 지킬 것',
+    '- 댓글 데이터에 없는 내용을 지어내지 말 것 — 반드시 실제 댓글만 근거로 삼을 것',
+    '- 2번·3번 섹션은 실제 댓글을 그대로 인용할 것',
+    '- 댓글이 적거나 판단이 애매하면 "데이터 부족"으로 명시',
+  ].join('\n');
+}
+
+server.registerTool(
+  'analyze_youtube_comments',
+  {
+    title: '유튜브 댓글 정성 분석 가이드',
+    description:
+      '붙여넣은 유튜브 댓글 텍스트(+ 선택적 영상/캠페인 설명)를 입력받아, ' +
+      '감성 분포·대표 반응·핵심 키워드·종합 인사이트를 정성 분석하기 위한 구조화된 지침(5개 섹션)과 ' +
+      '정리된 댓글 데이터를 반환합니다. YouTube API를 호출하지 않으며, 붙여넣은 텍스트만 처리합니다. ' +
+      '계산 도구가 아니라, Claude가 이 구조대로 분석을 작성하도록 안내하는 프롬프트 스캐폴딩입니다.',
+    inputSchema: youtubeInputShape,
+    outputSchema: youtubeOutputShape,
+  },
+  async ({ comments, video_context }) => {
+    const structured = {
+      video_context,
+      comments,
+      structure: YOUTUBE_SECTIONS,
+      instructions:
+        '위 structure의 5개 섹션을 순서·제목 그대로 작성하되, 댓글 데이터에 근거하고 내용을 지어내지 말 것. ' +
+        '2번·3번 섹션은 실제 댓글 원문을 인용할 것.',
+    };
+    return {
+      content: [{ type: 'text', text: youtubePrompt(video_context, comments) }],
+      structuredContent: structured,
+    };
+  },
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stdio 서버는 stdout을 프로토콜에 사용하므로 로그는 stderr로
-  console.error('mcp-budget-server (stdio) 시작됨 — analyze_estimate, generate_campaign_report 도구 제공');
+  console.error(
+    'mcp-budget-server (stdio) 시작됨 — analyze_estimate, generate_campaign_report, analyze_youtube_comments 도구 제공',
+  );
 }
 
 main().catch(err => {
