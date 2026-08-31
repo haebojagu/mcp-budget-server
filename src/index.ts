@@ -10,7 +10,14 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { config as loadDotenv } from 'dotenv';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { parseAmount } from './parse-amount.js';
+
+// dist/index.js 기준 프로젝트 루트의 .env를 읽는다 (cwd에 관계없이 동작).
+// quiet: true 필수 — 아니면 dotenv가 stdout에 로그를 찍어 MCP stdio(JSON-RPC) 프로토콜이 깨진다.
+loadDotenv({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.env'), quiet: true });
 
 // 입력 금액: 문자열("1.5억"/"95,120,000"/"△100,000") 또는 숫자, 또는 {label, amount}
 const amountValue = z.union([z.string(), z.number()]);
@@ -198,13 +205,20 @@ server.registerTool(
 /* ───────────────────────── analyze_youtube_comments ─────────────────────────
  * 계산 도구가 아니라, Claude에게 "이 형식으로 유튜브 댓글을 정성 분석하라"는
  * 구조화된 지침 + 정리된 댓글 데이터를 반환하는 프롬프트 스캐폴딩 도구.
- * YouTube API 호출 없음 — 사용자가 붙여넣은 댓글 텍스트만 처리.
+ * 댓글은 (a) 수동 붙여넣기 또는 (b) youtube_urls + YOUTUBE_API_KEY 자동 수집, 둘 다 가능.
  */
 const youtubeInputShape = {
   comments: z
     .string()
-    .min(1, 'comments는 비어 있을 수 없습니다.')
-    .describe('붙여넣은 유튜브 댓글 텍스트 (여러 줄 가능, 한 줄에 댓글 하나 정도)'),
+    .optional()
+    .describe('수동으로 붙여넣은 유튜브 댓글 텍스트 (여러 줄 가능, 한 줄에 댓글 하나 정도) — 선택'),
+  youtube_urls: z
+    .string()
+    .optional()
+    .describe(
+      '댓글을 자동 수집할 유튜브 영상 URL들, 줄바꿈으로 구분 (예: https://youtu.be/xxxx, https://www.youtube.com/watch?v=xxxx). ' +
+        'YOUTUBE_API_KEY 환경변수가 설정된 경우에만 동작 — 선택',
+    ),
   video_context: z
     .string()
     .optional()
@@ -216,9 +230,16 @@ const youtubeSection = z.object({
   title: z.string(),
   guide: z.string().describe('이 섹션에 무엇을 써야 하는지에 대한 작성 지침'),
 });
+const youtubeSource = z.object({
+  url: z.string(),
+  videoId: z.string(),
+  commentCount: z.number(),
+});
 const youtubeOutputShape = {
   video_context: z.string().optional(),
   comments: z.string(),
+  sources: z.array(youtubeSource).describe('youtube_urls로 자동 수집에 성공한 영상 목록'),
+  warnings: z.array(z.string()).describe('URL 인식 실패·API 오류 등 수집 중 발생한 경고'),
   structure: z.array(youtubeSection).describe('작성해야 할 분석 섹션 5개 (순서·제목·지침)'),
   instructions: z.string().describe('Claude가 따라야 할 종합 작성 규칙'),
 };
@@ -232,8 +253,79 @@ const YOUTUBE_SECTIONS = [
   { no: 5, title: '종합 인사이트', guide: '위 내용을 종합해 캠페인 관점에서 시사하는 바를 제시. 다음 액션에 참고할 만한 결론 위주로.' },
 ];
 
-function youtubePrompt(ctx: string | undefined, comments: string): string {
+// 다양한 유튜브 URL 형식(youtu.be, watch?v=, shorts, embed)에서 videoId 추출
+function extractVideoId(rawUrl: string): string | null {
+  try {
+    const u = new URL(rawUrl.trim());
+    if (u.hostname === 'youtu.be') {
+      return u.pathname.slice(1).split('/')[0] || null;
+    }
+    if (u.hostname.endsWith('youtube.com')) {
+      if (u.pathname === '/watch') return u.searchParams.get('v');
+      const m = u.pathname.match(/^\/(shorts|embed)\/([^/?]+)/);
+      if (m) return m[2];
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// YouTube Data API v3 commentThreads.list — 영상당 최대 100개
+async function fetchVideoComments(videoId: string, apiKey: string): Promise<string[]> {
+  const endpoint = new URL('https://www.googleapis.com/youtube/v3/commentThreads');
+  endpoint.searchParams.set('part', 'snippet');
+  endpoint.searchParams.set('videoId', videoId);
+  endpoint.searchParams.set('maxResults', '100');
+  endpoint.searchParams.set('order', 'relevance');
+  endpoint.searchParams.set('textFormat', 'plainText');
+  endpoint.searchParams.set('key', apiKey);
+
+  const res = await fetch(endpoint);
+  const data: any = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error?.message || `HTTP ${res.status}`);
+  }
+  const items = Array.isArray(data.items) ? data.items : [];
+  return items.map((item: any) => item?.snippet?.topLevelComment?.snippet?.textDisplay ?? '').filter(Boolean);
+}
+
+type YoutubeSource = z.infer<typeof youtubeSource>;
+
+// youtube_urls 텍스트를 파싱해 각 영상의 댓글을 수집. 실패한 항목은 warnings로 반환.
+async function collectYoutubeComments(
+  urlsText: string,
+  apiKey: string,
+): Promise<{ blocks: string[]; sources: YoutubeSource[]; warnings: string[] }> {
+  const urls = Array.from(new Set(urlsText.split(/\r?\n/).map(s => s.trim()).filter(Boolean)));
+  const blocks: string[] = [];
+  const sources: YoutubeSource[] = [];
+  const warnings: string[] = [];
+
+  for (const url of urls) {
+    const videoId = extractVideoId(url);
+    if (!videoId) {
+      warnings.push(`${url} : 인식할 수 없는 유튜브 URL 형식입니다.`);
+      continue;
+    }
+    try {
+      const texts = await fetchVideoComments(videoId, apiKey);
+      if (texts.length === 0) {
+        warnings.push(`${url} (videoId=${videoId}) : 댓글이 없거나 댓글 기능이 비활성화된 영상입니다.`);
+        continue;
+      }
+      sources.push({ url, videoId, commentCount: texts.length });
+      blocks.push(`[영상: ${url}]\n` + texts.map(t => `- ${t}`).join('\n'));
+    } catch (e: any) {
+      warnings.push(`${url} (videoId=${videoId}) : 댓글 수집 실패 — ${e?.message ?? String(e)}`);
+    }
+  }
+  return { blocks, sources, warnings };
+}
+
+function youtubePrompt(ctx: string | undefined, comments: string, warnings: string[]): string {
   const fmt = YOUTUBE_SECTIONS.map(s => `${s.no}. ${s.title}\n   → ${s.guide}`).join('\n');
+  const warningBlock = warnings.length ? '\n\n[수집 경고]\n' + warnings.map(w => `- ${w}`).join('\n') : '';
   return [
     '당신은 광고대행사 AE입니다. 아래 [입력 데이터]만 근거로, 유튜브 댓글에 대한 "정성 분석"을 한국어로 작성하세요.',
     '',
@@ -246,6 +338,7 @@ function youtubePrompt(ctx: string | undefined, comments: string): string {
     '',
     '■ 댓글',
     comments,
+    warningBlock,
     '',
     '[작성 규칙]',
     '- 각 섹션 제목을 그대로 사용하고, 섹션 순서를 지킬 것',
@@ -260,24 +353,80 @@ server.registerTool(
   {
     title: '유튜브 댓글 정성 분석 가이드',
     description:
-      '붙여넣은 유튜브 댓글 텍스트(+ 선택적 영상/캠페인 설명)를 입력받아, ' +
+      '유튜브 댓글을 수동 붙여넣기(comments) 또는 영상 URL 자동 수집(youtube_urls + YOUTUBE_API_KEY)으로 입력받아, ' +
       '감성 분포·대표 반응·핵심 키워드·종합 인사이트를 정성 분석하기 위한 구조화된 지침(5개 섹션)과 ' +
-      '정리된 댓글 데이터를 반환합니다. YouTube API를 호출하지 않으며, 붙여넣은 텍스트만 처리합니다. ' +
+      '정리된 댓글 데이터를 반환합니다. comments와 youtube_urls 중 최소 하나는 필요합니다. ' +
       '계산 도구가 아니라, Claude가 이 구조대로 분석을 작성하도록 안내하는 프롬프트 스캐폴딩입니다.',
     inputSchema: youtubeInputShape,
     outputSchema: youtubeOutputShape,
   },
-  async ({ comments, video_context }) => {
+  async ({ comments, youtube_urls, video_context }) => {
+    const manualText = comments?.trim() ?? '';
+    const urlsText = youtube_urls?.trim() ?? '';
+
+    if (!manualText && !urlsText) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: 'comments 또는 youtube_urls 중 최소 하나는 입력해야 합니다.' }],
+      };
+    }
+
+    let sources: YoutubeSource[] = [];
+    const warnings: string[] = [];
+    const autoBlocks: string[] = [];
+
+    if (urlsText) {
+      const apiKey = process.env.YOUTUBE_API_KEY;
+      if (!apiKey) {
+        const guide = 'YOUTUBE_API_KEY가 설정되지 않았습니다.\n.env에 키를 추가하거나 댓글을 직접 붙여넣어주세요.';
+        if (!manualText) {
+          return {
+            content: [{ type: 'text', text: guide }],
+            structuredContent: {
+              video_context,
+              comments: '',
+              sources: [],
+              warnings: [guide],
+              structure: YOUTUBE_SECTIONS,
+              instructions: guide,
+            },
+          };
+        }
+        warnings.push(guide);
+      } else {
+        const collected = await collectYoutubeComments(urlsText, apiKey);
+        autoBlocks.push(...collected.blocks);
+        sources = collected.sources;
+        warnings.push(...collected.warnings);
+      }
+    }
+
+    const combinedComments = [manualText, ...autoBlocks].filter(Boolean).join('\n\n');
+
+    if (!combinedComments) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: '분석할 댓글 데이터가 없습니다.\n' + (warnings.length ? warnings.map(w => `- ${w}`).join('\n') : ''),
+          },
+        ],
+      };
+    }
+
     const structured = {
       video_context,
-      comments,
+      comments: combinedComments,
+      sources,
+      warnings,
       structure: YOUTUBE_SECTIONS,
       instructions:
         '위 structure의 5개 섹션을 순서·제목 그대로 작성하되, 댓글 데이터에 근거하고 내용을 지어내지 말 것. ' +
         '2번·3번 섹션은 실제 댓글 원문을 인용할 것.',
     };
     return {
-      content: [{ type: 'text', text: youtubePrompt(video_context, comments) }],
+      content: [{ type: 'text', text: youtubePrompt(video_context, combinedComments, warnings) }],
       structuredContent: structured,
     };
   },

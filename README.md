@@ -12,6 +12,7 @@
 
 - Node.js 18 이상
 - (사용처) Claude Desktop 또는 MCP를 지원하는 클라이언트
+- (선택) `analyze_youtube_comments`의 유튜브 URL 자동 수집 기능을 쓰려면 **YouTube Data API v3 키**
 
 ## 설치
 
@@ -23,6 +24,49 @@ npm run build      # tsc → dist/index.js 생성
 ```
 
 > `dist/`는 git에 포함되지 않으므로 **클론 후 반드시 `npm run build`**를 실행해야 합니다.
+
+---
+
+## YouTube API 키 발급 및 설정 (선택)
+
+`analyze_youtube_comments` 도구에서 댓글을 직접 붙여넣지 않고 **유튜브 URL로 자동 수집**하려면 API 키가 필요합니다. 키가 없어도 댓글을 수동으로 붙여넣는 기존 방식은 그대로 동작합니다.
+
+### 1) 키 발급
+
+1. [Google Cloud Console](https://console.cloud.google.com/)에서 프로젝트를 생성(또는 선택)합니다.
+2. **APIs & Services → Library**에서 **YouTube Data API v3**를 검색해 **사용 설정(Enable)**합니다.
+3. **APIs & Services → Credentials → Create Credentials → API key**로 키를 발급받습니다.
+4. (권장) 발급된 키를 **YouTube Data API v3로 제한**해 오남용을 방지합니다.
+
+### 2) 키 설정 — 둘 중 하나
+
+**방법 A: `.env` 파일** (로컬에서 `node dist/index.js`로 직접 실행할 때)
+
+```bash
+cp .env.example .env
+# .env 파일을 열어 아래처럼 키 입력
+# YOUTUBE_API_KEY=발급받은_키
+```
+
+**방법 B: Claude Desktop 설정의 `env` 필드** (Claude Desktop에 등록해 쓸 때 더 확실한 방법)
+
+```json
+{
+  "mcpServers": {
+    "budget": {
+      "command": "node",
+      "args": ["/Users/<YOU>/mcp-budget-server/dist/index.js"],
+      "env": {
+        "YOUTUBE_API_KEY": "발급받은_키"
+      }
+    }
+  }
+}
+```
+
+> `.env`는 `.gitignore`에 포함되어 있어 git에 커밋되지 않습니다. 절대 키를 코드에 하드코딩하거나 커밋하지 마세요.
+
+키가 없는 상태에서 `youtube_urls`를 입력하면, 도구가 에러 대신 "`.env`에 키를 추가하거나 댓글을 직접 붙여넣어주세요" 안내 메시지를 반환합니다.
 
 ---
 
@@ -129,15 +173,46 @@ notepad "$env:APPDATA\Claude\claude_desktop_config.json"
 
 ---
 
+## 도구 레퍼런스: `analyze_youtube_comments`
+
+유튜브 댓글을 정성 분석(감성 분포·대표 반응·키워드·인사이트)하기 위한 프롬프트 스캐폴딩 도구. 계산이 아니라 Claude가 분석을 작성하도록 구조화된 지침을 반환합니다.
+
+**입력**
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `comments` | `string` (선택) | 수동으로 붙여넣은 댓글 텍스트 (여러 줄) |
+| `youtube_urls` | `string` (선택) | 자동 수집할 유튜브 영상 URL들, 줄바꿈으로 구분. `YOUTUBE_API_KEY` 필요 |
+| `video_context` | `string` (선택) | 영상/캠페인 설명 |
+
+`comments`와 `youtube_urls` 중 **최소 하나는 입력**해야 합니다. 둘 다 입력하면 두 출처의 댓글을 합쳐서 분석합니다.
+
+**출력** (`structuredContent`)
+
+| 필드 | 설명 |
+|------|------|
+| `comments` | 수동 입력 + 자동 수집을 합친 최종 댓글 텍스트 |
+| `sources` | `youtube_urls`로 자동 수집에 성공한 영상 목록 (`url`, `videoId`, `commentCount`) |
+| `warnings` | URL 인식 실패, API 키 미설정, 수집 실패 등 경고 메시지 |
+| `structure` | 작성할 5개 섹션 (감성 분포 / 대표 긍정 반응 / 대표 부정·이슈 반응 / 핵심 키워드 / 종합 인사이트) |
+| `instructions` | Claude가 따라야 할 작성 규칙 |
+
+> YouTube Data API 호출은 `youtube_urls`가 주어지고 `YOUTUBE_API_KEY`가 설정된 경우에만 발생하며, 영상당 최대 100개 댓글(`commentThreads.list`)을 가져옵니다.
+
+---
+
 ## 동작 확인 (스모크 테스트)
 
 ```bash
-npm run build && node smoke-test.mjs
+npm run build && node smoke-test.mjs           # analyze_estimate
+node smoke-test-report.mjs                     # generate_campaign_report
+node smoke-test-youtube.mjs                    # analyze_youtube_comments (키 없음/있음 케이스 포함)
 ```
-stdio로 `initialize → tools/list → tools/call`을 수행해 계산 결과를 검증합니다.
+stdio로 `initialize → tools/list → tools/call`을 수행해 각 도구의 동작을 검증합니다. `smoke-test-youtube.mjs`는 `YOUTUBE_API_KEY`가 없는 환경과 있는 환경을 각각 시뮬레이션해 안내 메시지·경고 처리를 확인합니다.
 
 ## 기술 스택
 
 - `@modelcontextprotocol/sdk` (stdio transport)
 - `zod` (입력/출력 스키마)
+- `dotenv` (`.env`에서 `YOUTUBE_API_KEY` 로드)
 - TypeScript (ESM, NodeNext)
